@@ -257,11 +257,29 @@ def extract_topic_request(text: str):
     return " ".join(words)
 
 
+# A bare topic is a NOUN-PHRASE label ("Natural numbers", "Trigonometry"), never
+# an imperative or a plea. These tokens mark a command/request directed at the
+# tutor ("GIVE ME a challenge", "HELP ME", "EXPLAIN THIS", "TELL ME MORE", "I WANT
+# to study", "LET ME try"); any of them disqualifies the phrase as a topic name.
+# Without this guard the broad letters-and-spaces match hijacked ordinary requests
+# into a bogus topic shift (test_results.md Bug 1, 2026-07-17). Chosen so none of
+# them appears in an NCERT Class-10 topic title (note: "some" is deliberately
+# excluded — "Some Applications of Trigonometry" is a real chapter).
+_NONTOPIC_TOKENS = frozenset({
+    "i", "im", "me", "my", "mine", "we", "us", "our", "you", "your",
+    "this", "that", "it", "them", "these", "those",
+    "please", "help", "give", "gimme", "tell", "show", "let", "lemme",
+    "want", "wanna", "explain", "teach", "do", "try", "start", "make",
+    "ask", "say", "more", "again", "another", "challenge",
+})
+
+
 def is_bare_topic(text: str) -> bool:
     """True for a short bare noun-phrase turn that looks like a topic label
     ("Natural numbers.", "Trigonometry"). Deliberately narrow: no question form,
-    no answer/ack/hint cue, no digits or operators. The caller must additionally
-    require that no diagnostic/micro question is open."""
+    no answer/ack/hint cue, no digits or operators, and no imperative/request token
+    (so "give me a challenge" / "please explain" are NOT read as topics). The caller
+    must additionally require that no diagnostic/micro question is open."""
     t = (text or "").strip().rstrip(".!").strip()
     if not t or "?" in text:
         return False
@@ -274,6 +292,9 @@ def is_bare_topic(text: str) -> bool:
         return False
     if re.match(r"^(yes|yeah|ya|yep|no|nope|nah|ok|okay|hmm+|uh+|um+)\b", t, re.IGNORECASE):
         return False
+    # imperative/plea, not a noun-phrase label — reject if any word is a request token
+    if any(re.sub(r"[^a-z']", "", w.lower()) in _NONTOPIC_TOKENS for w in words):
+        return False
     return bool(re.fullmatch(r"[a-zA-Z][a-zA-Z \-']*", t))
 
 
@@ -282,6 +303,76 @@ def is_answer_attempt(text: str) -> bool:
     ('i think it is...', 'the answer is', '= 5', 'is it 0'). Standalone runtime cue
     used to protect genuine attempts from the non-attempt guard."""
     return bool(ANSWER_RE.search(text or ""))
+
+
+# ---------------------------------------------------------------------------
+# Part 12 — session pedagogy mode requests (standalone cues; NOT feature-vector
+# entries, so NO classifier/policy rebuild — same contract as CLARIFY_RE etc.).
+# These let the ModeController switch EXPLAIN/PRACTICE/TEST on an explicit ask
+# (§5.1). Order matters at the call site: STOP_TEST is checked before TEST so
+# "stop the test" exits to EXPLAIN rather than starting one.
+# ---------------------------------------------------------------------------
+STOP_TEST_RE = re.compile(
+    r"\bstop (the )?(test|quiz|testing|quizzing)\b"
+    r"|\b(end|quit|finish|cancel|leave) (the )?(test|quiz)\b"
+    r"|no more (test|quiz|question)s?\b"
+    r"|\b(i )?do ?n'?t want (to (do |take )?(a )?)?(test|quiz|to be tested)\b"
+    r"|\bstop (practis|practic)ing\b|no more practice\b"
+    r"|\b(i )?do ?n'?t want to practi[cs]e\b",
+    re.IGNORECASE,
+)
+
+TEST_REQUEST_RE = re.compile(
+    r"\b(test|quiz) me\b|\bquiz\b"
+    r"|(can|could|shall|let'?s|will) (we|you|i) (do|take|try|start|have|give me) (a )?(test|quiz)"
+    r"|\bgive me (a )?(test|quiz)\b|\b(i )?want (a )?(test|quiz)\b"
+    r"|\btake (a |the )?(test|quiz)\b|check (how much|what) i (know|learned|learnt)"
+    r"|\btest my (knowledge|understanding)\b|\bexam me\b",
+    re.IGNORECASE,
+)
+
+PRACTICE_REQUEST_RE = re.compile(
+    r"\b(let'?s |can we |i want to |i wanna |lemme |let me )?practi[cs]e\b"
+    r"|give me (a |some )?(problem|sum|question|exercise|example)s?( to (solve|do|try))?"
+    r"|(more|another|some) (problem|sum|question|exercise|practice)s?\b"
+    r"|(let me|can i|i want to|i wanna) (try|solve|do) (a |some |the )?(problem|sum|question|one)"
+    r"|work (on )?(some |a few )?(problem|sum|question|example)s?\b"
+    r"|\blet'?s (do|try) (some |a few )?(problem|sum|question|example|practice)s?\b",
+    re.IGNORECASE,
+)
+
+EXPLAIN_REQUEST_RE = re.compile(
+    r"\b(go |get |take (me )?)?back to (learning|explaining|the lesson|explanation|teaching)\b"
+    r"|just (explain|teach)\b|\bexplain (it |this )?(again|more|properly)\b"
+    r"|\b(i )?want to (go back to )?learn(ing)?\b(?! .*\b(test|quiz|practi[cs]e)\b)"
+    r"|stop (the )?(problem|question|exercise)s?\b|no more (problem|sum|exercise)s?\b",
+    re.IGNORECASE,
+)
+
+
+def is_stop_test_request(text: str) -> bool:
+    """True when the student wants to leave TEST/PRACTICE mode but keep learning
+    (NOT a session-control 'bye'). Exits to EXPLAIN (§5.1). Check BEFORE the
+    test/practice cues so 'stop the test' does not start one."""
+    return bool(STOP_TEST_RE.search(text or ""))
+
+
+def is_test_request(text: str) -> bool:
+    """True for an explicit request to be quizzed/tested ('test me', 'quiz me',
+    'can we do a test'). Standalone runtime cue -> ModeController switches to TEST."""
+    return bool(TEST_REQUEST_RE.search(text or ""))
+
+
+def is_practice_request(text: str) -> bool:
+    """True for an explicit request to practice / get problems to solve ('let's
+    practice', 'give me a problem'). Standalone runtime cue -> switch to PRACTICE."""
+    return bool(PRACTICE_REQUEST_RE.search(text or ""))
+
+
+def is_explain_request(text: str) -> bool:
+    """True for an explicit request to return to plain explanation / learning
+    ('explain it again', 'back to learning', 'just explain'). -> switch to EXPLAIN."""
+    return bool(EXPLAIN_REQUEST_RE.search(text or ""))
 
 
 def is_pure_ack(text: str) -> bool:

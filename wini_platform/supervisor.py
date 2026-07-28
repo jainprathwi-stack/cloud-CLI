@@ -27,8 +27,11 @@ import urllib.request
 from pathlib import Path
 
 from .display.display_thread import DisplayThread
-from .touch.serial_head import SerialHead
 from . import ui_cards
+
+# SerialHead is imported lazily (in __init__) so the platform can run on a device
+# without pyserial / the STM32 head board — e.g. the Pi DSI + touch-UI build,
+# where the LVGL picker replaces the chin sensor. See --no-touch / --ui.
 
 # ── tunables (carried over from the ROS nodes) ──────────────────────────────
 HOLD_S = 3.0                 # chin hold needed to trigger start/wake
@@ -63,6 +66,9 @@ class WiniPlatform:
                  manage_server: bool = True,
                  fake_display: bool = False,
                  no_touch: bool = False,
+                 ui: bool = False,
+                 ui_port: int = 8140,
+                 ui_bin: Path | None = None,
                  log=print):
         self._log = log
         self.server_url = server_url.rstrip("/")
@@ -71,14 +77,38 @@ class WiniPlatform:
         self.manage_server = manage_server and (
             "127.0.0.1" in self.server_url or "localhost" in self.server_url)
 
+        # In UI mode the DSI is owned by wini_ui (LVGL), so the eyes DisplayThread
+        # must NOT grab the ST7796S SPI panel — force the NullDriver there too.
         driver = None
-        if fake_display:
+        if fake_display or ui:
             from .display.display_thread import NullDriver
             driver = NullDriver()
         self.display = DisplayThread(driver=driver)
 
-        self.head = None if no_touch else SerialHead(
-            on_chin=self._on_chin_level, on_head=self._on_head_level, log=log)
+        if no_touch:
+            self.head = None
+        else:
+            from .touch.serial_head import SerialHead
+            self.head = SerialHead(on_chin=self._on_chin_level,
+                                   on_head=self._on_head_level, log=log)
+
+        # LVGL touch-UI mode (Pi DSI): the supervisor launches wini_ui and the
+        # client drives it over the mode channel (ModeChannelSink) instead of the
+        # in-process eyes DisplayThread. A card tap picks the mode AND wakes the
+        # client (the chin-hold analogue). See wini_ui/ + wini_client/mode_channel.py.
+        self._stop = threading.Event()
+        self.ui = ui
+        self.ui_port = ui_port
+        self.ui_bin = Path(ui_bin) if ui_bin else (CORE_ROOT / "wini_ui" / "build" / "wini_ui")
+        self.mode_state = None
+        self.mode_channel = None
+        self._ui_proc: subprocess.Popen | None = None
+        if self.ui:
+            from wini_client.mode_channel import ModeChannel, ModeState
+            self.mode_state = ModeState()
+            self.mode_channel = ModeChannel(
+                self.mode_state, port=self.ui_port,
+                on_mode=self._on_ui_mode, stop_event=self._stop, log=log)
 
         # chin-hold state machine (written on the serial read thread, read on
         # the tick — single-writer per field, GIL-atomic floats/bools)
@@ -92,7 +122,8 @@ class WiniPlatform:
         self._blush_until = 0.0
         self._last_blush_trigger = 0.0
 
-        # head-touch emotion cycle (demo)
+        # head-touch emotion cycle (demo) — replaced by the emotion engine
+        # when a GPIO touch reader is available, but kept as fallback.
         self._head_level = False
         self._head_cycling = False
         self._head_idx = 0
@@ -111,7 +142,58 @@ class WiniPlatform:
         self._client_stop = threading.Event()
         self._server_proc: subprocess.Popen | None = None
 
-        self._stop = threading.Event()
+        # ── Emotion-based touch audio engine ─────────────────────────────
+        # GPIO touch reader (direct TTP223 on GPIO22, Pi 5 gpiochip4).
+        # Falls back gracefully: if lgpio is unavailable or the pin can't be
+        # claimed, the engine simply doesn't start — everything else works.
+        self._gpio_touch = None
+        self._gesture_rec = None
+        self.emotion_engine = None
+        self.audio_manager = None
+        self._init_emotion_engine(log)
+
+    def _init_emotion_engine(self, log) -> None:
+        try:
+            from wini_client.sound_bank import SoundBank
+            from wini_client.audio_manager import AudioManager
+            from wini_client.client import play_pcm
+            
+            sound_bank = SoundBank()
+            self.audio_manager = AudioManager(play_fn=play_pcm, sound_bank=sound_bank, log=log)
+        except Exception as e:
+            log(f"[platform] failed to initialize audio manager: {e}")
+            return
+
+        try:
+            from .touch_gestures import TouchGestureRecognizer
+            from .emotion_engine import EmotionEngine
+
+            self._gesture_rec = TouchGestureRecognizer(
+                on_single_tap=lambda: self.emotion_engine.on_single_tap() if self.emotion_engine else None,
+                on_double_tap=lambda: self.emotion_engine.on_double_tap() if self.emotion_engine else None,
+                on_hold_start=lambda: self.emotion_engine.on_hold_start() if self.emotion_engine else None,
+                on_hold_end=lambda dur: self.emotion_engine.on_hold_end(dur) if self.emotion_engine else None,
+                on_pat_sequence=lambda count: self.emotion_engine.on_pat_sequence(count) if self.emotion_engine else None,
+                log=log
+            )
+
+            self.emotion_engine = EmotionEngine(self.audio_manager, log=log)
+        except Exception as e:
+            log(f"[platform] failed to initialize emotion engine: {e}")
+            return
+
+        # If touch is enabled, initialize the GPIO touch reader
+        if self.head is not None:
+            try:
+                from .touch.gpio_touch import GpioTouchReader
+                self._gpio_touch = GpioTouchReader(
+                    gpio_pin=22,
+                    chip=4,
+                    on_touch=self._gesture_rec.on_level,
+                    log=log
+                )
+            except Exception as e:
+                log(f"[platform] failed to initialize GpioTouchReader: {e}")
 
     # ── brain service helpers ────────────────────────────────────────────────
 
@@ -178,6 +260,53 @@ class WiniPlatform:
         self.display.set_emotion(*self._prev_emotion)
         self.display.set_gaze(0.0, 0.0)
 
+    # ── LVGL touch UI (Pi DSI panel) ─────────────────────────────────────────
+
+    def _ui_send(self, obj: dict) -> None:
+        """Best-effort command to the LVGL UI (no-op when not in UI mode)."""
+        if self.mode_channel is not None:
+            self.mode_channel.send(obj)
+
+    def _ui_alive(self) -> bool:
+        return self._ui_proc is not None and self._ui_proc.poll() is None
+
+    def _start_ui(self) -> None:
+        """Launch the wini_ui LVGL process on the DSI. Best-effort: a missing
+        binary or X display disables the panel but never stops the platform."""
+        if self._ui_alive():
+            return
+        if not self.ui_bin.exists():
+            self._log(f"[platform] wini_ui binary not found at {self.ui_bin} "
+                      "(build it under wini_ui/build) — UI disabled")
+            return
+        env = dict(os.environ)
+        env.setdefault("DISPLAY", ":0")
+        env.setdefault("XAUTHORITY", os.path.expanduser("~/.Xauthority"))
+        # The voice client owns the reSpeaker's single playback substream —
+        # the UI's SDL audio must never claim it or Wini's voice goes silent
+        # (wini_client/SPEAKER_TROUBLESHOOTING.md; main.c also defaults dummy).
+        env.setdefault("SDL_AUDIODRIVER", "dummy")
+        logs = CORE_ROOT / "logs"
+        logs.mkdir(exist_ok=True)
+        out = open(logs / "wini_ui.log", "ab")
+        try:
+            self._ui_proc = subprocess.Popen(
+                [str(self.ui_bin), "--port", str(self.ui_port)],
+                cwd=str(CORE_ROOT), env=env, stdout=out,
+                stderr=subprocess.STDOUT,
+                start_new_session=(os.name == "posix"))
+            self._log(f"[platform] launched wini_ui (pid {self._ui_proc.pid}) "
+                      f"-> {logs / 'wini_ui.log'}")
+        except Exception as e:  # noqa: BLE001 — the panel is optional
+            self._log(f"[platform] could not launch wini_ui: {e}")
+
+    def _on_ui_mode(self, mode: str) -> None:
+        """A card tap picked a pedagogy mode; treat it as the wake gesture too —
+        if the client is asleep, start it (the chin-hold analogue on the Pi)."""
+        if not self._client_alive() and not self._starting:
+            self._log(f"[platform] UI mode '{mode}' — waking client")
+            self._trigger()
+
     # ── touch callbacks (serial read thread — keep fast) ────────────────────
 
     def _on_chin_level(self, level: bool) -> None:
@@ -206,6 +335,9 @@ class WiniPlatform:
     def _on_head_level(self, level: bool) -> None:
         # serial read thread — keep fast; the cycling is driven from _tick.
         self._head_level = level
+        # Also feed the gesture recognizer if the emotion engine is active.
+        if self._gesture_rec is not None:
+            self._gesture_rec.on_level(level)
 
     # ── client lifecycle ─────────────────────────────────────────────────────
 
@@ -227,8 +359,10 @@ class WiniPlatform:
 
     def _start_pipeline(self) -> None:
         wake_only = self._health_ready()   # brain warm, client asleep after "bye"
-        self._log("[platform] chin hold: "
+        self._log("[platform] trigger: "
                   + ("waking client" if wake_only else "cold-starting brain"))
+        self._ui_send({"cmd": "loading", "on": 1,
+                       "text": "Waking Wini..." if wake_only else "Wini is waking up..."})
         if not wake_only and self.manage_server and not self._server_alive():
             self._spawn_server()
         deadline = WAKE_TIMEOUT_S if wake_only else STARTUP_TIMEOUT_S
@@ -237,6 +371,7 @@ class WiniPlatform:
             if self._health_ready():
                 self._starting = False
                 self.display.show_overlay(ui_cards.ready_card(), timeout_s=2.5)
+                self._ui_send({"cmd": "loading", "on": 0})
                 self._start_client()
                 self._log("[platform] pipeline ready")
                 return
@@ -246,6 +381,8 @@ class WiniPlatform:
             self._log("[platform] brain did not become ready in time")
             self.display.show_overlay(ui_cards.failed_card("check logs/server.log"),
                                       timeout_s=5.0)
+            self._ui_send({"cmd": "loading", "on": 1,
+                           "text": "Start failed - check logs"})
 
     def _start_client(self) -> None:
         if self._client_alive():
@@ -288,20 +425,33 @@ class WiniPlatform:
 
     def _client_worker(self) -> None:
         from wini_client.client import BrainClient, run_session
-        from wini_client.display_sinks import InProcSink
 
         self._pin_usb_audio()
         self._wait_capture_ready()
-        sink = InProcSink(self.store_dir, self.display,
-                          set_thinking=self.set_thinking)
+        # UI mode: drive the LVGL panel over the mode channel; the touch card
+        # already selected the pedagogy mode (stamped per turn). Otherwise the
+        # in-process eyes DisplayThread (the Jetson robot path) is unchanged.
+        if self.ui:
+            from wini_client.display_sinks import ModeChannelSink
+            sink = ModeChannelSink(self.mode_channel, self.store_dir)
+            mode_state = self.mode_state
+            wake_hint = "tap a card to wake."
+        else:
+            from wini_client.display_sinks import InProcSink
+            sink = InProcSink(self.store_dir, self.display,
+                              set_thinking=self.set_thinking)
+            mode_state = None
+            wake_hint = "hold chin to wake."
         brain = BrainClient(self.server_url)
         try:
             brain.wait_ready(timeout_s=60.0)
             reason = run_session(brain, sink, trigger="vad",
                                  exit_on_session_end=True,
-                                 stop_event=self._client_stop)
+                                 stop_event=self._client_stop,
+                                 mode_state=mode_state,
+                                 audio_manager=self.audio_manager)
             self._log(f"[platform] client session over ({reason}) — sleeping; "
-                      "hold chin to wake.")
+                      + wake_hint)
         except Exception as e:  # noqa: BLE001
             self._log(f"[platform] client loop died: {e}")
         finally:
@@ -327,22 +477,24 @@ class WiniPlatform:
         if hold_start is not None and not self._fired and now - hold_start >= HOLD_S:
             self._fired = True
             self._trigger()
-        # head-hold emotion cycle (manual demo) — only when idle
-        if self._head_level and not self._thinking and not self._starting:
-            if not self._head_cycling:
-                self._head_cycling = True
-                self._head_idx = 0
-                self._head_last_advance = now
-                self.display.set_emotion(HEAD_CYCLE[0], HEAD_CYCLE_INTENSITY)
-            elif now - self._head_last_advance >= HEAD_CYCLE_S:
-                self._head_idx = (self._head_idx + 1) % len(HEAD_CYCLE)
-                self._head_last_advance = now
-                self.display.set_emotion(HEAD_CYCLE[self._head_idx],
-                                         HEAD_CYCLE_INTENSITY)
-        elif self._head_cycling and not self._head_level:
-            self._head_cycling = False
-            if not self._thinking and not self._blushing:
-                self.display.set_emotion(*IDLE_EMOTION)
+        # head-hold emotion cycle (manual demo) — only when the emotion engine
+        # is NOT active (emotion engine replaces this feature).
+        if self.emotion_engine is None:
+            if self._head_level and not self._thinking and not self._starting:
+                if not self._head_cycling:
+                    self._head_cycling = True
+                    self._head_idx = 0
+                    self._head_last_advance = now
+                    self.display.set_emotion(HEAD_CYCLE[0], HEAD_CYCLE_INTENSITY)
+                elif now - self._head_last_advance >= HEAD_CYCLE_S:
+                    self._head_idx = (self._head_idx + 1) % len(HEAD_CYCLE)
+                    self._head_last_advance = now
+                    self.display.set_emotion(HEAD_CYCLE[self._head_idx],
+                                             HEAD_CYCLE_INTENSITY)
+            elif self._head_cycling and not self._head_level:
+                self._head_cycling = False
+                if not self._thinking and not self._blushing:
+                    self.display.set_emotion(*IDLE_EMOTION)
         # thinking face animation (emotion re-assert + wandering up-gaze)
         if self._thinking:
             if now - self._think_started > THINK_TIMEOUT_S:
@@ -365,12 +517,28 @@ class WiniPlatform:
         if self._starting:
             self._loading_dots += 1
             self.display.show_overlay(ui_cards.loading_card(self._loading_dots))
+        # keep the LVGL panel alive: relaunch if it crashed (best-effort, no spam —
+        # only when it had started and then exited, never when the binary is absent)
+        if self.ui and self._ui_proc is not None and self._ui_proc.poll() is not None:
+            self._log("[platform] wini_ui exited — relaunching")
+            self._ui_proc = None
+            self._start_ui()
+        # Emotion engine tick (mood decay, state transitions, idle sounds)
+        if self.emotion_engine is not None:
+            self.emotion_engine.tick(TICK_S)
 
     def run(self, autostart: bool = False) -> None:
         self.display.start()
         if self.head is not None:
             self.head.start()
-        self._log(f"[platform] up: hold chin {HOLD_S:.0f}s to start/wake; "
+        if self._gpio_touch is not None:
+            self._gpio_touch.start()
+        if self.ui:
+            self.mode_channel.start()      # server side of the mode channel
+            self._start_ui()               # launch the LVGL panel on the DSI
+        trigger_hint = ("tap a card" if self.ui
+                        else f"hold chin {HOLD_S:.0f}s") + " to start/wake"
+        self._log(f"[platform] up: {trigger_hint}; "
                   f"brain={self.server_url} "
                   f"(managed={'yes' if self.manage_server else 'no'})")
         if autostart:
@@ -391,8 +559,19 @@ class WiniPlatform:
         self._stop.set()
         self._log("[platform] shutting down...")
         self._stop_client()
+        if self.audio_manager is not None:
+            self.audio_manager.shutdown()
+        if self._gpio_touch is not None:
+            self._gpio_touch.shutdown()
         if self.head is not None:
             self.head.shutdown()
+        if self._ui_alive():
+            self._log("[platform] stopping wini_ui")
+            self._ui_proc.terminate()
+            try:
+                self._ui_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._ui_proc.kill()
         self.display.stop()
         if self._server_alive():
             self._log("[platform] stopping managed wini_server.py")
